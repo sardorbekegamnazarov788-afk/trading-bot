@@ -8,7 +8,7 @@ import yfinance as yf
 import pandas as pd
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, MACD
-from ta.volatility import BollingerBands
+from ta.volatility import BollingerBands, AverageTrueRange
 
 BOT_TOKEN = "8673591792:AAFSHOgBQerGUy8trOQpCgD_8casDTqn4uw"
 CHAT_ID = "8355121174"
@@ -26,7 +26,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Trading bot with MACD and Bollinger Bands is running 24/7!")
+        self.wfile.write(b"Trading bot with SL/TP calculation is running 24/7!")
 
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
@@ -52,9 +52,8 @@ def get_market_data(ticker: str):
     # 1. RSI (14)
     df['RSI'] = RSIIndicator(close=df['Close'], window=14).rsi()
 
-    # 2. Trend (EMA 200 va EMA 50)
+    # 2. Trend (EMA 200)
     df['EMA_200'] = EMAIndicator(close=df['Close'], window=200).ema_indicator()
-    df['EMA_50'] = EMAIndicator(close=df['Close'], window=50).ema_indicator()
 
     # 3. Bollinger Bands (20, std=2)
     bb = BollingerBands(close=df['Close'], window=20, window_dev=2)
@@ -65,7 +64,10 @@ def get_market_data(ticker: str):
     macd = MACD(close=df['Close'], window_fast=12, window_slow=26, window_sign=9)
     df['MACD'] = macd.macd()
     df['MACD_SIGNAL'] = macd.macd_signal()
-    df['MACD_DIFF'] = macd.macd_diff()
+
+    # 5. ATR (14) - Stop Loss va Take Profit hisobi uchun
+    atr = AverageTrueRange(high=df['High'], low=df['Low'], close=df['Close'], window=14)
+    df['ATR'] = atr.average_true_range()
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
@@ -81,7 +83,7 @@ def get_market_data(ticker: str):
         "macd_signal": float(last['MACD_SIGNAL']),
         "prev_macd": float(prev['MACD']),
         "prev_macd_signal": float(prev['MACD_SIGNAL']),
-        "macd_diff": float(last['MACD_DIFF'])
+        "atr": float(last['ATR'])
     }
 
 def check_asset(asset: dict):
@@ -102,12 +104,9 @@ def check_asset(asset: dict):
         macd_signal = data["macd_signal"]
         prev_macd = data["prev_macd"]
         prev_macd_signal = data["prev_macd_signal"]
+        atr = data["atr"]
 
-        # 🟢 YUQORI ANIKLIKDAGI BUY SIGNALI:
-        # Shart 1: Narx 200 EMA ustida (Trend o'sishda)
-        # Shart 2: Narx Bollinger Bands'ning pastki chegarasiga yaqin yoki undan qaytgan
-        # Shart 3: RSI 30-40 oralig'idan yuqoriga qayrilyapti
-        # Shart 4: MACD chizig'i Signal chizig'ini pastdan yuqoriga kesib o'tmoqda
+        # BUY shartlari
         is_buy = (
             price > ema200 and
             price <= (bb_low * 1.01) and
@@ -115,52 +114,60 @@ def check_asset(asset: dict):
             prev_macd <= prev_macd_signal and macd > macd_signal
         )
 
-        # 🔴 YUQORI ANIKLIKDAGI SELL SIGNALI:
-        # Shart 1: Narx Bollinger Bands yuqori chegarasiga yetgan/kesgan
-        # Shart 2: RSI 70 dan baland (haddan tashqari qizigan)
-        # Shart 3: MACD tepadan pastga qarab kesishmoqda
+        # SELL shartlari
         is_sell = (
             price >= (bb_high * 0.99) and
             rsi > 70 and
             prev_macd >= prev_macd_signal and macd < macd_signal
         )
 
+        # Stop Loss va Take Profit hisobi (Risk/Reward 1:2)
+        sl_distance = atr * 1.5
+        tp_distance = atr * 3.0
+
         if is_buy:
+            sl_price = price - sl_distance
+            tp_price = price + tp_distance
             msg = (
                 f"🟢 *KUCHLI SIGNAL: SAVDOGA KIRISH (BUY)*\n\n"
                 f"📊 *Aktiv:* {name}\n"
-                f"💵 *Kirish narxi:* `{price:.2f}`\n"
-                f"📈 *RSI (H1):* `{rsi:.1f}`\n"
-                f"🌊 *Bollinger Bands:* Pastki tasmadan qaytish\n"
-                f"⚡ *MACD:* Yuqoriga kesishma tasdiqlandi\n"
+                f"💵 *Kirish narxi:* `{price:.2f}`\n\n"
+                f"🎯 *Take Profit (TP):* `{tp_price:.2f}`\n"
+                f"🛑 *Stop Loss (SL):* `{sl_price:.2f}`\n"
+                f"⚖️ *Risk/Reward:* 1:2 nisbatda\n\n"
+                f"📈 *RSI (H1):* `{rsi:.1f}` | ⚡ *MACD:* Yuqoriga kesishma\n"
                 f"🛡 *Trend:* 200 EMA ustida (Xavfsiz)"
             )
             send_telegram(msg)
             print(f"[{name}] KUCHLI BUY signali yuborildi.")
+
         elif is_sell:
+            sl_price = price + sl_distance
+            tp_price = price - tp_distance
             msg = (
-                f"🔴 *KUCHLI SIGNAL: SOTISH / FOYDANI YOPISH (SELL)*\n\n"
+                f"🔴 *KUCHLI SIGNAL: SOTISH (SELL)*\n\n"
                 f"📊 *Aktiv:* {name}\n"
-                f"💵 *Chiqish narxi:* `{price:.2f}`\n"
-                f"⚠️ *RSI (H1):* `{rsi:.1f}`\n"
-                f"🌊 *Bollinger Bands:* Yuqori chegaraga yetdi\n"
-                f"⚡ *MACD:* Pasayish signali tasdiqlandi"
+                f"💵 *Kirish narxi:* `{price:.2f}`\n\n"
+                f"🎯 *Take Profit (TP):* `{tp_price:.2f}`\n"
+                f"🛑 *Stop Loss (SL):* `{sl_price:.2f}`\n"
+                f"⚖️ *Risk/Reward:* 1:2 nisbatda\n\n"
+                f"⚠️ *RSI (H1):* `{rsi:.1f}` | 🌊 *Bollinger:* Yuqori chegara"
             )
             send_telegram(msg)
             print(f"[{name}] KUCHLI SELL signali yuborildi.")
         else:
-            print(f"[{name}] Narx: {price:.2f} | RSI: {rsi:.1f} | MACD: {macd:.2f} | Kutilmoqda...")
+            print(f"[{name}] Narx: {price:.2f} | RSI: {rsi:.1f} | Kutilmoqda...")
 
     except Exception as e:
         print(f"Xatolik ({name}): {e}")
 
 def daily_morning_report():
-    msg = "☀️ *Xayrli tong!*\nBot to'liq filtrlash rejimida faol ishlamoqda.\n\n📊 *Joriy bozor holati (H1):*\n"
+    msg = "☀️ *Xayrli tong!*\nBot to'liq hisob-kitob (SL/TP) rejimida faol ishlamoqda.\n\n📊 *Joriy bozor holati (H1):*\n"
     for asset in WATCHLIST:
         data = get_market_data(asset["ticker"])
         if data:
             msg += f"▫️ *{asset['name']}:* `{data['price']:.2f}` | RSI: `{data['rsi']:.1f}` | MACD: `{data['macd']:.2f}`\n"
-    msg += "\n🔍 *Kuchli signallar kutilmoqda!*"
+    msg += "\n🔍 *Bozor to'liq nazorat ostida!*"
     send_telegram(msg)
 
 def listen_for_commands():
@@ -178,7 +185,7 @@ def listen_for_commands():
 
                         if sender_id == CHAT_ID:
                             if text in ["/status", "status", "/holat"]:
-                                status_msg = "⚡ *Joriy bozor holati (Kuchaytirilgan indikatorlar):*\n\n"
+                                status_msg = "⚡ *Joriy bozor holati (H1):*\n\n"
                                 for asset in WATCHLIST:
                                     data = get_market_data(asset["ticker"])
                                     if data:
@@ -188,10 +195,10 @@ def listen_for_commands():
                                             f"📊 RSI: `{data['rsi']:.1f}` | MACD: `{data['macd']:.2f}`\n"
                                             f"🌊 BB Pastki: `{data['bb_low']:.2f}` | Yuqori: `{data['bb_high']:.2f}`\n\n"
                                         )
-                                status_msg += "✅ *Tahlil davom etmoqda.*"
+                                status_msg += "✅ *SL va TP hisobi faollashtirilgan.*"
                                 send_telegram(status_msg)
                             elif text in ["/start"]:
-                                send_telegram("👋 Salom! Kuchaytirilgan savdo boti aloqada. Holatni ko'rish uchun **/status** deb yozing.")
+                                send_telegram("👋 Salom! Bot aloqada. Bozor holatini bilish uchun **/status** deb yozing.")
         except Exception:
             time.sleep(2)
         time.sleep(1)
@@ -205,7 +212,7 @@ schedule.every(15).minutes.do(main_job)
 schedule.every().day.at("08:00").do(daily_morning_report)
 
 if __name__ == "__main__":
-    send_telegram("🚀 *Bot yangilandi: MACD va Bollinger Bands qo'shildi!*\nSignallar sifati va filtri maksimal darajaga ko'tarildi.")
+    send_telegram("🎯 *Bot yangilandi: Stop Loss va Take Profit hisobi qo'shildi!*\nEndi har bir signalda aniq SL va TP darajalari beriladi.")
 
     threading.Thread(target=run_web_server, daemon=True).start()
     threading.Thread(target=listen_for_commands, daemon=True).start()
