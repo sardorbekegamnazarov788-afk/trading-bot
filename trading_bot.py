@@ -1,5 +1,7 @@
+import os
 import time
 import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
 import schedule
 import yfinance as yf
@@ -17,8 +19,20 @@ WATCHLIST = [
     {"name": "EUR/USD", "ticker": "EURUSD=X"}
 ]
 
+# Render port talabini qondirish uchun yengil veb-server
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b"Trading bot is running 24/7!")
+
+def run_web_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthHandler)
+    server.serve_forever()
+
 def send_telegram(text: str):
-    """Telegramga xabar jo'natish"""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
     try:
@@ -27,7 +41,6 @@ def send_telegram(text: str):
         print(f"Xatolik: {e}")
 
 def get_market_data(ticker: str):
-    """Aktiv bo'yicha narx va indikatorlarni hisoblash"""
     df = yf.download(ticker, period="1mo", interval="1h", progress=False)
     if df.empty or len(df) < 200:
         return None
@@ -53,7 +66,6 @@ def get_market_data(ticker: str):
     }
 
 def check_asset(asset: dict):
-    """Signallarni tekshirish (har 15 daqiqada ishlaydi)"""
     name = asset["name"]
     ticker = asset["ticker"]
     try:
@@ -69,15 +81,12 @@ def check_asset(asset: dict):
         prev_ema50 = data["prev_ema50"]
         prev_ema200 = data["prev_ema200"]
 
-        # BUY signali
         if price > ema200 and prev_rsi < 35 and rsi >= 35:
             msg = f"🟢 *SAVDOGA KIRISH (BUY)*\n\n📊 *Aktiv:* {name}\n💵 *Narx:* `{price:.2f}`\n📈 *RSI:* `{rsi:.1f}`"
             send_telegram(msg)
-        # Golden Cross
         elif prev_ema50 <= prev_ema200 and ema50 > ema200:
             msg = f"🚀 *KUCHLI BUY (Golden Cross)*\n\n📊 *Aktiv:* {name}\n💵 *Narx:* `{price:.2f}`"
             send_telegram(msg)
-        # SELL signali
         elif rsi > 70 and prev_rsi <= 70:
             msg = f"🔴 *FOYDANI OLISH / SOTISH (SELL)*\n\n📊 *Aktiv:* {name}\n💵 *Narx:* `{price:.2f}`\n⚠️ *RSI:* `{rsi:.1f}`"
             send_telegram(msg)
@@ -88,7 +97,6 @@ def check_asset(asset: dict):
         print(f"Xatolik ({name}): {e}")
 
 def daily_morning_report():
-    """2-USUL: Har kuni ertalabki salomlashish va holat hisoboti"""
     msg = "☀️ *Xayrli tong!*\nBot serverda 24/7 faol ishlamoqda.\n\n📊 *Joriy bozor holati:*\n"
     for asset in WATCHLIST:
         data = get_market_data(asset["ticker"])
@@ -98,7 +106,6 @@ def daily_morning_report():
     send_telegram(msg)
 
 def listen_for_commands():
-    """3-USUL: Telegramdan /status yoki /start buyruqlarini tinglash"""
     last_update_id = 0
     while True:
         try:
@@ -111,7 +118,6 @@ def listen_for_commands():
                         text = update["message"]["text"].strip()
                         sender_id = str(update["message"]["chat"]["id"])
 
-                        # Faqat sizning shaxsiy profilingizga javob beradi
                         if sender_id == CHAT_ID:
                             if text in ["/status", "status", "/holat"]:
                                 status_msg = "⚡ *Joriy bozor holati va narxlar:*\n\n"
@@ -122,7 +128,7 @@ def listen_for_commands():
                                 status_msg += "✅ *Bot faol ishlamoqda.*"
                                 send_telegram(status_msg)
                             elif text in ["/start"]:
-                                send_telegram("👋 Salom! Bot aloqada. Bozor holatini bilish uchun istalgan vaqt **/status** deb yozing.")
+                                send_telegram("👋 Salom! Bot aloqada. Bozor holatini bilish uchun **/status** deb yozing.")
         except Exception:
             time.sleep(2)
         time.sleep(1)
@@ -132,16 +138,16 @@ def main_job():
     for asset in WATCHLIST:
         check_asset(asset)
 
-# Har 15 daqiqada bozorni skaner qilish
 schedule.every(15).minutes.do(main_job)
-
-# 2-usul: Har kuni ertalab soat 08:00 da hisobot yuborish
 schedule.every().day.at("08:00").do(daily_morning_report)
 
 if __name__ == "__main__":
-    send_telegram("🤖 *Bot yangilandi!*\nEndi botga **/status** deb yozsangiz, holatni ko'rsatadi va har kuni ertalab 08:00 da hisobot beradi.")
-    
-    # Buyruqlarni tinglovchi qismni alohida oqimda ishga tushirish
+    send_telegram("🤖 *Bot yangilandi va portga ulandi!*\nServer endi to'xtamaydi. **/status** buyrug'i faol.")
+
+    # Render portini ushlab turish uchun veb-serverni ishga tushirish
+    threading.Thread(target=run_web_server, daemon=True).start()
+
+    # Telegram buyruqlarini tinglash
     threading.Thread(target=listen_for_commands, daemon=True).start()
 
     main_job()
