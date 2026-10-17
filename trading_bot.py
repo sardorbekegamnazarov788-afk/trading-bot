@@ -1,5 +1,6 @@
 import os
 import time
+import datetime
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import requests
@@ -21,7 +22,7 @@ ESKIZ_PASSWORD = "70487"   # Eskiz.uz parolingiz
 PHONE_NUMBER = "998503032355"                 # Telefon raqamingiz
 # ==========================================
 
-# 7 ta eng kuchli aktivlar ro'yxati
+# 7 ta asosiy aktiv
 WATCHLIST = [
     {"name": "OLTIN (XAU/USD)", "ticker": "GC=F"},
     {"name": "KUMUSH (XAG/USD)", "ticker": "SI=F"},
@@ -33,6 +34,8 @@ WATCHLIST = [
 ]
 
 last_processed_candle = {}
+today_high_impact_news = []
+news_warning_sent = False
 
 # Render portini ushlab turuvchi veb-server
 class HealthHandler(BaseHTTPRequestHandler):
@@ -40,7 +43,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Trading bot (7 Assets + Multi-TF) is running 24/7!")
+        self.wfile.write(b"Trading bot (Multi-TF + News Filter + SMS) is running 24/7!")
 
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
@@ -56,7 +59,6 @@ def send_telegram(text: str):
         print(f"Telegram xatoligi: {e}")
 
 def send_sms_eskiz(text: str):
-    """Eskiz.uz orqali to'g'ridan-to'g'ri telefonga SMS yuborish"""
     try:
         login_url = "https://notify.eskiz.uz/api/auth/login"
         login_data = {"email": ESKIZ_EMAIL, "password": ESKIZ_PASSWORD}
@@ -81,6 +83,66 @@ def send_sms_eskiz(text: str):
     except Exception as e:
         print(f"SMS xatoligi: {e}")
 
+def update_economic_calendar():
+    """ForexFactory haftalik taqvimini yuklab, Qizil va EIA yangiliklarini saqlash"""
+    global today_high_impact_news
+    try:
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            events = resp.json()
+            parsed_news = []
+            for ev in events:
+                impact = ev.get('impact', '')
+                title = ev.get('title', '')
+                date_str = ev.get('date', '') # ISO format: 2026-10-18T14:30:00-04:00
+
+                # Qizil yangiliklar yoki Neft zaxiralari (EIA Crude Oil)
+                if impact == 'High' or 'Crude Oil Inventories' in title:
+                    try:
+                        # UTC formatida vaqtni olish
+                        dt = datetime.datetime.fromisoformat(date_str)
+                        parsed_news.append({
+                            "title": title,
+                            "country": ev.get('country', ''),
+                            "time": dt
+                        })
+                    except Exception:
+                        continue
+            today_high_impact_news = parsed_news
+            print(f"Iqtisodiy taqvim yangilandi: {len(today_high_impact_news)} ta muhim yangilik aniqlandi.")
+    except Exception as e:
+        print(f"Taqvim yuklashda xatolik: {e}")
+
+def is_news_time():
+    """Hozir muhim yangilik chiqishi arafasida yoki uning ta'siridami?"""
+    global news_warning_sent
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+
+    for item in today_high_impact_news:
+        news_dt = item["time"]
+        diff_minutes = (news_dt - now_utc).total_seconds() / 60.0
+
+        # Yangilikka 30 daqiqa qolgandan, chiqqanidan keyin 30 daqiqa o'tguncha
+        if -30 <= diff_minutes <= 30:
+            if not news_warning_sent and diff_minutes > 0:
+                msg = (
+                    f"⚠️ *IQTISODIY TAQVIM OGOHLANTIRIShI:*\n\n"
+                    f"📢 *Yangilik:* {item['title']} ({item['country']})\n"
+                    f"⏳ *Qolgan vaqt:* taxminan `{int(diff_minutes)}` daqiqa\n\n"
+                    f"🛡 *Xavfsizlik chorasi:* Bozor tebranishlari xavfi sababli yangi signallar berish vaqtincha to'xtatildi!"
+                )
+                send_telegram(msg)
+                news_warning_sent = True
+            return True, item['title']
+
+    if news_warning_sent:
+        send_telegram("✅ *Muhim yangiliklar davri yakunlandi.* Bozor barqarorlashdi, oddiy tahlil rejimi qayta yoqildi.")
+        news_warning_sent = False
+
+    return False, None
+
 def get_higher_tf_trend(ticker: str):
     trends = {"H4": "NEUTRAL", "D1": "NEUTRAL", "W1": "NEUTRAL"}
     try:
@@ -104,7 +166,6 @@ def get_higher_tf_trend(ticker: str):
         if not df_w1.empty and len(df_w1) >= 50:
             ema50_w1 = EMAIndicator(close=df_w1['Close'], window=50).ema_indicator().iloc[-1]
             trends["W1"] = "UP" if df_w1['Close'].iloc[-1] > ema50_w1 else "DOWN"
-
     except Exception as e:
         print(f"Trend xatoligi ({ticker}): {e}")
 
@@ -153,6 +214,12 @@ def get_market_data(ticker: str):
     }
 
 def check_asset(asset: dict):
+    # 1. Yangiliklar tahlili: Agar yangilik vaqti bo'lsa, signal tekshirilmaydi
+    in_news, news_name = is_news_time()
+    if in_news:
+        print(f"Yangiliklar vaqti ({news_name}). Signallar to'xtatilgan.")
+        return
+
     name = asset["name"]
     ticker = asset["ticker"]
     try:
@@ -213,7 +280,8 @@ def check_asset(asset: dict):
                 f"🛑 *Stop Loss (SL):* `{sl_price:.4f}`\n"
                 f"⚖️ *Risk/Reward:* 1:2 nisbatda\n\n"
                 f"📈 *H1 holati:* RSI `{rsi:.1f}`, MACD yuqoriga\n"
-                f"🧭 *Trendlar:* H4 [🟢 UP] | D1 [🟢 UP]{w1_extra}"
+                f"🧭 *Trendlar:* H4 [🟢 UP] | D1 [🟢 UP]{w1_extra}\n"
+                f"📰 *Yangiliklar:* Bozor xotirjam (Yangilik xavfi yo'q)"
             )
             send_telegram(msg)
             send_sms_eskiz("Bu Eskizdan test")
@@ -236,7 +304,8 @@ def check_asset(asset: dict):
                 f"🛑 *Stop Loss (SL):* `{sl_price:.4f}`\n"
                 f"⚖️ *Risk/Reward:* 1:2 nisbatda\n\n"
                 f"⚠️ *H1 holati:* RSI `{rsi:.1f}`, MACD pasayishga\n"
-                f"🧭 *Trendlar:* H4 [🔴 DOWN] | D1 [🔴 DOWN]{w1_extra}"
+                f"🧭 *Trendlar:* H4 [🔴 DOWN] | D1 [🔴 DOWN]{w1_extra}\n"
+                f"📰 *Yangiliklar:* Bozor xotirjam (Yangilik xavfi yo'q)"
             )
             send_telegram(msg)
             send_sms_eskiz("Bu Eskizdan test")
@@ -249,13 +318,13 @@ def check_asset(asset: dict):
         print(f"Xatolik ({name}): {e}")
 
 def daily_morning_report():
-    msg = "☀️ *Xayrli tong!*\n7 ta aktiv bo'yicha Multi-TF tahlilchi faol ishlamoqda.\n\n📊 *Bozor holati:*\n"
+    msg = "☀️ *Xayrli tong!*\n7 ta aktiv bo'yicha Multi-TF va Yangiliklar filtri faol.\n\n📊 *Bozor holati:*\n"
     for asset in WATCHLIST:
         data = get_market_data(asset["ticker"])
         trends = get_higher_tf_trend(asset["ticker"])
         if data:
             msg += f"▫️ *{asset['name']}:* `{data['price']:.4f}` (H4: {trends['H4']} | D1: {trends['D1']})\n"
-    msg += "\n🔍 *Tasdiqlangan signallar kutilmoqda!*"
+    msg += "\n🔍 *Xavfsiz va tasdiqlangan signallar kutilmoqda!*"
     send_telegram(msg)
 
 def listen_for_commands():
@@ -273,7 +342,9 @@ def listen_for_commands():
 
                         if sender_id == CHAT_ID:
                             if text in ["/status", "status", "/holat"]:
-                                status_msg = "⚡ *Joriy bozor va Trendlar holati (7 ta aktiv):*\n\n"
+                                in_news, news_name = is_news_time()
+                                news_status = f"⚠️ Xavfli yangilik: {news_name}" if in_news else "🟢 Tinch (Xavf yo'q)"
+                                status_msg = f"⚡ *Bozor va Yangiliklar holati:*\n📰 *Yangiliklar taqvimi:* {news_status}\n\n"
                                 for asset in WATCHLIST:
                                     data = get_market_data(asset["ticker"])
                                     trends = get_higher_tf_trend(asset["ticker"])
@@ -284,10 +355,10 @@ def listen_for_commands():
                                             f"📊 RSI (H1): `{data['rsi']:.1f}` | MACD: `{data['macd']:.2f}`\n"
                                             f"🧭 Trend: H4 [{trends['H4']}] | D1 [{trends['D1']}] | W1 [{trends['W1']}]\n\n"
                                         )
-                                status_msg += "✅ *Barcha filtrlar faol.*"
+                                status_msg += "✅ *News Filter va Multi-TF faol.*"
                                 send_telegram(status_msg)
                             elif text in ["/start"]:
-                                send_telegram("👋 Salom! 7 ta aktiv bo'yicha Multi-TF boti aloqada. Holatni bilish uchun **/status** deb yozing.")
+                                send_telegram("👋 Salom! Yangiliklar filtri va SMS ulangan savdo boti aloqada. Holat uchun **/status** deb yozing.")
         except Exception:
             time.sleep(2)
         time.sleep(1)
@@ -297,11 +368,16 @@ def main_job():
     for asset in WATCHLIST:
         check_asset(asset)
 
+# Taqvimni har kuni ertalab 06:00 da va har 4 soatda yangilab turadi
+schedule.every(4).hours.do(update_economic_calendar)
 schedule.every(15).minutes.do(main_job)
 schedule.every().day.at("08:00").do(daily_morning_report)
 
 if __name__ == "__main__":
-    send_telegram("👑 *Bot yangilandi: 7 ta asosiy aktiv joylashtirildi!*\n(Oltin, Kumush, Neft, GBP/USD, EUR/USD, USD/JPY, AUD/USD)\nMulti-Timeframe va SMS tizimi to'liq faol.")
+    send_telegram("🛡 *Bot yangilandi: ForexFactory va EIA (Neft zaxiralari) yangiliklar filtri muvaffaqiyatli ulandi!*\nEndi xavfli yangiliklar paytida bot savdoni avtomatik to'xtatib turadi.")
+
+    # Birinchi ishga tushganda taqvimni yuklab olish
+    update_economic_calendar()
 
     threading.Thread(target=run_web_server, daemon=True).start()
     threading.Thread(target=listen_for_commands, daemon=True).start()
