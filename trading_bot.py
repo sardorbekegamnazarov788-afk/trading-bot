@@ -1,4 +1,5 @@
 import time
+import threading
 import requests
 import schedule
 import yfinance as yf
@@ -17,65 +18,132 @@ WATCHLIST = [
 ]
 
 def send_telegram(text: str):
+    """Telegramga xabar jo'natish"""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     data = {"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown"}
     try:
         requests.post(url, json=data, timeout=10)
     except Exception as e:
-        print(f"Telegramga jo'natishda xatolik: {e}")
+        print(f"Xatolik: {e}")
+
+def get_market_data(ticker: str):
+    """Aktiv bo'yicha narx va indikatorlarni hisoblash"""
+    df = yf.download(ticker, period="1mo", interval="1h", progress=False)
+    if df.empty or len(df) < 200:
+        return None
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    df['RSI'] = RSIIndicator(close=df['Close'], window=14).rsi()
+    df['EMA_200'] = EMAIndicator(close=df['Close'], window=200).ema_indicator()
+    df['EMA_50'] = EMAIndicator(close=df['Close'], window=50).ema_indicator()
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    return {
+        "price": float(last['Close']),
+        "rsi": float(last['RSI']),
+        "prev_rsi": float(prev['RSI']),
+        "ema200": float(last['EMA_200']),
+        "ema50": float(last['EMA_50']),
+        "prev_ema50": float(prev['EMA_50']),
+        "prev_ema200": float(prev['EMA_200'])
+    }
 
 def check_asset(asset: dict):
+    """Signallarni tekshirish (har 15 daqiqada ishlaydi)"""
     name = asset["name"]
     ticker = asset["ticker"]
     try:
-        df = yf.download(ticker, period="1mo", interval="1h", progress=False)
-        if df.empty or len(df) < 200:
+        data = get_market_data(ticker)
+        if not data:
             return
 
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        price = data["price"]
+        rsi = data["rsi"]
+        prev_rsi = data["prev_rsi"]
+        ema200 = data["ema200"]
+        ema50 = data["ema50"]
+        prev_ema50 = data["prev_ema50"]
+        prev_ema200 = data["prev_ema200"]
 
-        df['RSI'] = RSIIndicator(close=df['Close'], window=14).rsi()
-        df['EMA_200'] = EMAIndicator(close=df['Close'], window=200).ema_indicator()
-        df['EMA_50'] = EMAIndicator(close=df['Close'], window=50).ema_indicator()
-
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-
-        price = float(last['Close'])
-        rsi = float(last['RSI'])
-        prev_rsi = float(prev['RSI'])
-        ema200 = float(last['EMA_200'])
-        ema50 = float(last['EMA_50'])
-        prev_ema50 = float(prev['EMA_50'])
-        prev_ema200 = float(prev['EMA_200'])
-
+        # BUY signali
         if price > ema200 and prev_rsi < 35 and rsi >= 35:
             msg = f"🟢 *SAVDOGA KIRISH (BUY)*\n\n📊 *Aktiv:* {name}\n💵 *Narx:* `{price:.2f}`\n📈 *RSI:* `{rsi:.1f}`"
             send_telegram(msg)
-            print(f"[{name}] BUY signali yuborildi.")
+        # Golden Cross
         elif prev_ema50 <= prev_ema200 and ema50 > ema200:
             msg = f"🚀 *KUCHLI BUY (Golden Cross)*\n\n📊 *Aktiv:* {name}\n💵 *Narx:* `{price:.2f}`"
             send_telegram(msg)
-            print(f"[{name}] Golden Cross yuborildi.")
+        # SELL signali
         elif rsi > 70 and prev_rsi <= 70:
             msg = f"🔴 *FOYDANI OLISH / SOTISH (SELL)*\n\n📊 *Aktiv:* {name}\n💵 *Narx:* `{price:.2f}`\n⚠️ *RSI:* `{rsi:.1f}`"
             send_telegram(msg)
-            print(f"[{name}] SELL signali yuborildi.")
         else:
             print(f"[{name}] Narx: {price:.2f} | RSI: {rsi:.1f} | Kutilmoqda...")
+
     except Exception as e:
         print(f"Xatolik ({name}): {e}")
+
+def daily_morning_report():
+    """2-USUL: Har kuni ertalabki salomlashish va holat hisoboti"""
+    msg = "☀️ *Xayrli tong!*\nBot serverda 24/7 faol ishlamoqda.\n\n📊 *Joriy bozor holati:*\n"
+    for asset in WATCHLIST:
+        data = get_market_data(asset["ticker"])
+        if data:
+            msg += f"▫️ *{asset['name']}:* Narx: `{data['price']:.2f}` | RSI: `{data['rsi']:.1f}`\n"
+    msg += "\n🔍 *Bozor to'liq nazorat ostida!*"
+    send_telegram(msg)
+
+def listen_for_commands():
+    """3-USUL: Telegramdan /status yoki /start buyruqlarini tinglash"""
+    last_update_id = 0
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={last_update_id + 1}&timeout=30"
+            resp = requests.get(url, timeout=35).json()
+            if "result" in resp:
+                for update in resp["result"]:
+                    last_update_id = update["update_id"]
+                    if "message" in update and "text" in update["message"]:
+                        text = update["message"]["text"].strip()
+                        sender_id = str(update["message"]["chat"]["id"])
+
+                        # Faqat sizning shaxsiy profilingizga javob beradi
+                        if sender_id == CHAT_ID:
+                            if text in ["/status", "status", "/holat"]:
+                                status_msg = "⚡ *Joriy bozor holati va narxlar:*\n\n"
+                                for asset in WATCHLIST:
+                                    data = get_market_data(asset["ticker"])
+                                    if data:
+                                        status_msg += f"📌 *{asset['name']}*\n💵 Narx: `{data['price']:.2f}`\n📊 RSI (H1): `{data['rsi']:.1f}`\n\n"
+                                status_msg += "✅ *Bot faol ishlamoqda.*"
+                                send_telegram(status_msg)
+                            elif text in ["/start"]:
+                                send_telegram("👋 Salom! Bot aloqada. Bozor holatini bilish uchun istalgan vaqt **/status** deb yozing.")
+        except Exception:
+            time.sleep(2)
+        time.sleep(1)
 
 def main_job():
     print(f"\n--- Bozor tekshiruvi: {time.strftime('%Y-%m-%d %H:%M:%S')} ---")
     for asset in WATCHLIST:
         check_asset(asset)
 
+# Har 15 daqiqada bozorni skaner qilish
 schedule.every(15).minutes.do(main_job)
 
+# 2-usul: Har kuni ertalab soat 08:00 da hisobot yuborish
+schedule.every().day.at("08:00").do(daily_morning_report)
+
 if __name__ == "__main__":
-    send_telegram("🤖 *Savdo signallari boti serverda ishga tushdi!*\nBozor monitoringi boshlandi.")
+    send_telegram("🤖 *Bot yangilandi!*\nEndi botga **/status** deb yozsangiz, holatni ko'rsatadi va har kuni ertalab 08:00 da hisobot beradi.")
+    
+    # Buyruqlarni tinglovchi qismni alohida oqimda ishga tushirish
+    threading.Thread(target=listen_for_commands, daemon=True).start()
+
     main_job()
     while True:
         schedule.run_pending()
