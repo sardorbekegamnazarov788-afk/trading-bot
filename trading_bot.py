@@ -24,18 +24,19 @@ PHONE_NUMBER = "998503032355"                 # Telefon raqamingiz
 
 # 7 ta asosiy aktiv
 WATCHLIST = [
-    {"name": "OLTIN (XAU/USD)", "ticker": "GC=F"},
-    {"name": "KUMUSH (XAG/USD)", "ticker": "SI=F"},
-    {"name": "NEFT (Crude Oil WTI)", "ticker": "CL=F"},
-    {"name": "GBP/USD", "ticker": "GBPUSD=X"},
-    {"name": "EUR/USD", "ticker": "EURUSD=X"},
-    {"name": "USD/JPY", "ticker": "USDJPY=X"},
-    {"name": "AUD/USD", "ticker": "AUDUSD=X"}
+    {"name": "OLTIN (XAU/USD)", "ticker": "GC=F", "is_usd": True},
+    {"name": "KUMUSH (XAG/USD)", "ticker": "SI=F", "is_usd": True},
+    {"name": "NEFT (Crude Oil WTI)", "ticker": "CL=F", "is_usd": False},
+    {"name": "GBP/USD", "ticker": "GBPUSD=X", "is_usd": True},
+    {"name": "EUR/USD", "ticker": "EURUSD=X", "is_usd": True},
+    {"name": "USD/JPY", "ticker": "USDJPY=X", "is_usd": True},
+    {"name": "AUD/USD", "ticker": "AUDUSD=X", "is_usd": True}
 ]
 
 last_processed_candle = {}
 today_high_impact_news = []
 news_warning_sent = False
+last_usd_signal_time = None  # Korrelyatsiyani cheklash uchun
 
 # Render portini ushlab turuvchi veb-server
 class HealthHandler(BaseHTTPRequestHandler):
@@ -43,7 +44,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Trading bot (Multi-TF + News Filter + SMS) is running 24/7!")
+        self.wfile.write(b"Trading bot (Multi-TF + News + Sessions + Price Action) is running 24/7!")
 
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
@@ -83,8 +84,22 @@ def send_sms_eskiz(text: str):
     except Exception as e:
         print(f"SMS xatoligi: {e}")
 
+def is_active_trading_session():
+    """1-FILTR: London va Nyu-York faol soatlari (Toshkent vaqti bilan 13:00 dan 22:30 gacha)"""
+    # Toshkent UTC+5
+    tashkent_now = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=5)
+    hour = tashkent_now.hour
+    minute = tashkent_now.minute
+
+    # 13:00 dan 22:30 gacha
+    if 13 <= hour < 22:
+        return True
+    elif hour == 22 and minute <= 30:
+        return True
+    return False
+
 def update_economic_calendar():
-    """ForexFactory haftalik taqvimini yuklab, Qizil va EIA yangiliklarini saqlash"""
+    """ForexFactory yangiliklar taqvimi"""
     global today_high_impact_news
     try:
         url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
@@ -96,12 +111,10 @@ def update_economic_calendar():
             for ev in events:
                 impact = ev.get('impact', '')
                 title = ev.get('title', '')
-                date_str = ev.get('date', '') # ISO format: 2026-10-18T14:30:00-04:00
+                date_str = ev.get('date', '')
 
-                # Qizil yangiliklar yoki Neft zaxiralari (EIA Crude Oil)
                 if impact == 'High' or 'Crude Oil Inventories' in title:
                     try:
-                        # UTC formatida vaqtni olish
                         dt = datetime.datetime.fromisoformat(date_str)
                         parsed_news.append({
                             "title": title,
@@ -111,12 +124,12 @@ def update_economic_calendar():
                     except Exception:
                         continue
             today_high_impact_news = parsed_news
-            print(f"Iqtisodiy taqvim yangilandi: {len(today_high_impact_news)} ta muhim yangilik aniqlandi.")
+            print(f"Taqvim yangilandi: {len(today_high_impact_news)} ta muhim yangilik aniqlandi.")
     except Exception as e:
-        print(f"Taqvim yuklashda xatolik: {e}")
+        print(f"Taqvim yuklash xatosi: {e}")
 
 def is_news_time():
-    """Hozir muhim yangilik chiqishi arafasida yoki uning ta'siridami?"""
+    """Yangiliklar vaqtini tekshirish"""
     global news_warning_sent
     now_utc = datetime.datetime.now(datetime.timezone.utc)
 
@@ -124,14 +137,13 @@ def is_news_time():
         news_dt = item["time"]
         diff_minutes = (news_dt - now_utc).total_seconds() / 60.0
 
-        # Yangilikka 30 daqiqa qolgandan, chiqqanidan keyin 30 daqiqa o'tguncha
         if -30 <= diff_minutes <= 30:
             if not news_warning_sent and diff_minutes > 0:
                 msg = (
-                    f"⚠️ *IQTISODIY TAQVIM OGOHLANTIRIShI:*\n\n"
+                    f"⚠️ *IQTISODIY TAQVIM OGOHLANTIRISHI:*\n\n"
                     f"📢 *Yangilik:* {item['title']} ({item['country']})\n"
                     f"⏳ *Qolgan vaqt:* taxminan `{int(diff_minutes)}` daqiqa\n\n"
-                    f"🛡 *Xavfsizlik chorasi:* Bozor tebranishlari xavfi sababli yangi signallar berish vaqtincha to'xtatildi!"
+                    f"🛡 *Xavfsizlik chorasi:* Yangi signallar berish vaqtincha to'xtatildi!"
                 )
                 send_telegram(msg)
                 news_warning_sent = True
@@ -197,9 +209,31 @@ def get_market_data(ticker: str):
     prev_closed = df.iloc[-3]
     candle_time = str(df.index[-2])
 
+    # 3-FILTR: Price Action (Sham shakllari hisobi)
+    c_open = float(closed['Open'])
+    c_close = float(closed['Close'])
+    c_high = float(closed['High'])
+    c_low = float(closed['Low'])
+    body = abs(c_close - c_open)
+    total_range = c_high - c_low if (c_high - c_low) > 0 else 0.0001
+    lower_shadow = (c_open - c_low) if c_close >= c_open else (c_close - c_low)
+    upper_shadow = (c_high - c_close) if c_close >= c_open else (c_high - c_open)
+
+    # Oldingi shamcha ma'lumotlari
+    p_open = float(prev_closed['Open'])
+    p_close = float(prev_closed['Close'])
+
+    # Bullish tasdiq: Bolg'acha (Hammer/Pin-bar) yoki Yutib yuborish (Bullish Engulfing)
+    is_bullish_pa = (lower_shadow >= (body * 1.5) and lower_shadow >= (total_range * 0.4)) or \
+                    (c_close > c_open and p_close < p_open and c_close >= p_open and c_open <= p_close)
+
+    # Bearish tasdiq: Shooting Star yoki Yutib yuborish (Bearish Engulfing)
+    is_bearish_pa = (upper_shadow >= (body * 1.5) and upper_shadow >= (total_range * 0.4)) or \
+                    (c_close < c_open and p_close > p_open and c_open >= p_close and c_close <= p_open)
+
     return {
         "time": candle_time,
-        "price": float(closed['Close']),
+        "price": c_close,
         "rsi": float(closed['RSI']),
         "prev_rsi": float(prev_closed['RSI']),
         "ema200": float(closed['EMA_200']),
@@ -210,18 +244,26 @@ def get_market_data(ticker: str):
         "prev_macd": float(prev_closed['MACD']),
         "prev_macd_signal": float(prev_closed['MACD_SIGNAL']),
         "atr": float(closed['ATR']),
-        "live_price": float(df.iloc[-1]['Close'])
+        "is_bullish_pa": is_bullish_pa,
+        "is_bearish_pa": is_bearish_pa
     }
 
 def check_asset(asset: dict):
-    # 1. Yangiliklar tahlili: Agar yangilik vaqti bo'lsa, signal tekshirilmaydi
+    global last_usd_signal_time
+
+    # 1. Savdo soatlari tekshiruvi (London va Nyu-York)
+    if not is_active_trading_session():
+        return
+
+    # 2. Yangiliklar vaqti tekshiruvi
     in_news, news_name = is_news_time()
     if in_news:
-        print(f"Yangiliklar vaqti ({news_name}). Signallar to'xtatilgan.")
         return
 
     name = asset["name"]
     ticker = asset["ticker"]
+    is_usd = asset.get("is_usd", False)
+
     try:
         data = get_market_data(ticker)
         if not data:
@@ -247,24 +289,38 @@ def check_asset(asset: dict):
         prev_macd = data["prev_macd"]
         prev_macd_signal = data["prev_macd_signal"]
         atr = data["atr"]
+        is_bullish_pa = data["is_bullish_pa"]
+        is_bearish_pa = data["is_bearish_pa"]
 
+        # BUY shartlari (H1 indikatorlari + Price Action)
         h1_buy = (
             price > ema200 and
             price <= (bb_low * 1.01) and
             prev_rsi < 40 and rsi >= 40 and
-            prev_macd <= prev_macd_signal and macd > macd_signal
+            prev_macd <= prev_macd_signal and macd > macd_signal and
+            is_bullish_pa
         )
 
+        # SELL shartlari (H1 indikatorlari + Price Action)
         h1_sell = (
             price >= (bb_high * 0.99) and
             rsi > 70 and
-            prev_macd >= prev_macd_signal and macd < macd_signal
+            prev_macd >= prev_macd_signal and macd < macd_signal and
+            is_bearish_pa
         )
 
         sl_distance = atr * 1.5
         tp_distance = atr * 3.0
 
+        now_timestamp = time.time()
+
+        # BUY signali
         if h1_buy and h4_trend == "UP" and d1_trend == "UP":
+            # 2-FILTR: Dollar korrelyatsiyasi nazorati (Oxirgi 60 daqiqada USD signal bo'lmagan bo'lishi kerak)
+            if is_usd and last_usd_signal_time and (now_timestamp - last_usd_signal_time < 3600):
+                print(f"[{name}] Korrelyatsiya filtri: Yaqinda USD signali berilgan, o'tkazib yuborildi.")
+                return
+
             sl_price = price - sl_distance
             tp_price = price + tp_distance
 
@@ -279,16 +335,24 @@ def check_asset(asset: dict):
                 f"🎯 *Take Profit (TP):* `{tp_price:.4f}`\n"
                 f"🛑 *Stop Loss (SL):* `{sl_price:.4f}`\n"
                 f"⚖️ *Risk/Reward:* 1:2 nisbatda\n\n"
+                f"🕯 *Price Action:* Shamcha o'sishga tasdiq berdi (Pin-bar/Engulfing)\n"
                 f"📈 *H1 holati:* RSI `{rsi:.1f}`, MACD yuqoriga\n"
                 f"🧭 *Trendlar:* H4 [🟢 UP] | D1 [🟢 UP]{w1_extra}\n"
-                f"📰 *Yangiliklar:* Bozor xotirjam (Yangilik xavfi yo'q)"
+                f"🕒 *Sessiya:* Faol likvidlik soatlari (13:00 - 22:30)"
             )
             send_telegram(msg)
             send_sms_eskiz("Bu Eskizdan test")
-            print(f"[{name}] BUY signali yuborildi.")
+            print(f"[{name}] KUCHLI BUY signali yuborildi.")
             last_processed_candle[ticker] = candle_time
+            if is_usd:
+                last_usd_signal_time = now_timestamp
 
+        # SELL signali
         elif h1_sell and h4_trend == "DOWN" and d1_trend == "DOWN":
+            if is_usd and last_usd_signal_time and (now_timestamp - last_usd_signal_time < 3600):
+                print(f"[{name}] Korrelyatsiya filtri: Yaqinda USD signali berilgan, o'tkazib yuborildi.")
+                return
+
             sl_price = price + sl_distance
             tp_price = price - tp_distance
 
@@ -303,14 +367,17 @@ def check_asset(asset: dict):
                 f"🎯 *Take Profit (TP):* `{tp_price:.4f}`\n"
                 f"🛑 *Stop Loss (SL):* `{sl_price:.4f}`\n"
                 f"⚖️ *Risk/Reward:* 1:2 nisbatda\n\n"
+                f"🕯 *Price Action:* Shamcha pasayishga tasdiq berdi (Shooting Star/Engulfing)\n"
                 f"⚠️ *H1 holati:* RSI `{rsi:.1f}`, MACD pasayishga\n"
                 f"🧭 *Trendlar:* H4 [🔴 DOWN] | D1 [🔴 DOWN]{w1_extra}\n"
-                f"📰 *Yangiliklar:* Bozor xotirjam (Yangilik xavfi yo'q)"
+                f"🕒 *Sessiya:* Faol likvidlik soatlari (13:00 - 22:30)"
             )
             send_telegram(msg)
             send_sms_eskiz("Bu Eskizdan test")
-            print(f"[{name}] SELL signali yuborildi.")
+            print(f"[{name}] KUCHLI SELL signali yuborildi.")
             last_processed_candle[ticker] = candle_time
+            if is_usd:
+                last_usd_signal_time = now_timestamp
         else:
             print(f"[{name}] H1: {price:.2f} | H4: {h4_trend} | D1: {d1_trend} | Kutilmoqda...")
 
@@ -318,13 +385,13 @@ def check_asset(asset: dict):
         print(f"Xatolik ({name}): {e}")
 
 def daily_morning_report():
-    msg = "☀️ *Xayrli tong!*\n7 ta aktiv bo'yicha Multi-TF va Yangiliklar filtri faol.\n\n📊 *Bozor holati:*\n"
+    msg = "☀️ *Xayrli tong!*\nBot to'liq himoyalangan (Multi-TF + News + Sessiya + Price Action) rejimida faol.\n\n📊 *Bozor holati:*\n"
     for asset in WATCHLIST:
         data = get_market_data(asset["ticker"])
         trends = get_higher_tf_trend(asset["ticker"])
         if data:
             msg += f"▫️ *{asset['name']}:* `{data['price']:.4f}` (H4: {trends['H4']} | D1: {trends['D1']})\n"
-    msg += "\n🔍 *Xavfsiz va tasdiqlangan signallar kutilmoqda!*"
+    msg += "\n🕒 *Faol savdo soatlari:* Toshkent vaqti bilan 13:00 da boshlanadi!"
     send_telegram(msg)
 
 def listen_for_commands():
@@ -343,8 +410,15 @@ def listen_for_commands():
                         if sender_id == CHAT_ID:
                             if text in ["/status", "status", "/holat"]:
                                 in_news, news_name = is_news_time()
-                                news_status = f"⚠️ Xavfli yangilik: {news_name}" if in_news else "🟢 Tinch (Xavf yo'q)"
-                                status_msg = f"⚡ *Bozor va Yangiliklar holati:*\n📰 *Yangiliklar taqvimi:* {news_status}\n\n"
+                                session_ok = is_active_trading_session()
+                                session_status = "🟢 Faol (London/NY)" if session_ok else "🌙 Passiv soat (Kutilmoqda)"
+                                news_status = f"⚠️ Xavfli yangilik: {news_name}" if in_news else "🟢 Tinch"
+
+                                status_msg = (
+                                    f"⚡ *Bozor va Tizim holati:*\n"
+                                    f"🕒 *Sessiya holati:* {session_status}\n"
+                                    f"📰 *Yangiliklar:* {news_status}\n\n"
+                                )
                                 for asset in WATCHLIST:
                                     data = get_market_data(asset["ticker"])
                                     trends = get_higher_tf_trend(asset["ticker"])
@@ -352,13 +426,13 @@ def listen_for_commands():
                                         status_msg += (
                                             f"📌 *{asset['name']}*\n"
                                             f"💵 Narx: `{data['price']:.4f}`\n"
-                                            f"📊 RSI (H1): `{data['rsi']:.1f}` | MACD: `{data['macd']:.2f}`\n"
+                                            f"📊 RSI: `{data['rsi']:.1f}` | MACD: `{data['macd']:.2f}`\n"
                                             f"🧭 Trend: H4 [{trends['H4']}] | D1 [{trends['D1']}] | W1 [{trends['W1']}]\n\n"
                                         )
-                                status_msg += "✅ *News Filter va Multi-TF faol.*"
+                                status_msg += "✅ *Price Action va Korrelyatsiya nazorati faol.*"
                                 send_telegram(status_msg)
                             elif text in ["/start"]:
-                                send_telegram("👋 Salom! Yangiliklar filtri va SMS ulangan savdo boti aloqada. Holat uchun **/status** deb yozing.")
+                                send_telegram("👋 Salom! Mukammallashtirilgan savdo boti aloqada. Holat uchun **/status** deb yozing.")
         except Exception:
             time.sleep(2)
         time.sleep(1)
@@ -368,15 +442,14 @@ def main_job():
     for asset in WATCHLIST:
         check_asset(asset)
 
-# Taqvimni har kuni ertalab 06:00 da va har 4 soatda yangilab turadi
+# Taqvim har 4 soatda yangilanadi, tekshiruv har 15 daqiqada
 schedule.every(4).hours.do(update_economic_calendar)
 schedule.every(15).minutes.do(main_job)
 schedule.every().day.at("08:00").do(daily_morning_report)
 
 if __name__ == "__main__":
-    send_telegram("🛡 *Bot yangilandi: ForexFactory va EIA (Neft zaxiralari) yangiliklar filtri muvaffaqiyatli ulandi!*\nEndi xavfli yangiliklar paytida bot savdoni avtomatik to'xtatib turadi.")
+    send_telegram("💎 *Bot eng yuqori darajaga yetkazildi!*\nQo'shildi: Savdo soatlari filtri (13:00 - 22:30), Dollar korrelyatsiyasi nazorati va Price Action (Pin-bar/Engulfing) tasdig'i.")
 
-    # Birinchi ishga tushganda taqvimni yuklab olish
     update_economic_calendar()
 
     threading.Thread(target=run_web_server, daemon=True).start()
