@@ -16,16 +16,20 @@ CHAT_ID = "8355121174"
 
 # ==========================================
 # 📱 ESKIZ.UZ SMS SOZLAMALARI:
-ESKIZ_EMAIL = "sardorbekegamnazarov788@gmail.com"       # Eskiz.uz profilingizdagi email
+ESKIZ_EMAIL = "sardorbekegamnazarov788@gmail.com"       # Eskiz.uz emailingiz
 ESKIZ_PASSWORD = "70487"   # Eskiz.uz parolingiz
 PHONE_NUMBER = "998503032355"                 # Telefon raqamingiz
 # ==========================================
 
+# 7 ta eng kuchli aktivlar ro'yxati
 WATCHLIST = [
     {"name": "OLTIN (XAU/USD)", "ticker": "GC=F"},
+    {"name": "KUMUSH (XAG/USD)", "ticker": "SI=F"},
     {"name": "NEFT (Crude Oil WTI)", "ticker": "CL=F"},
     {"name": "GBP/USD", "ticker": "GBPUSD=X"},
-    {"name": "EUR/USD", "ticker": "EURUSD=X"}
+    {"name": "EUR/USD", "ticker": "EURUSD=X"},
+    {"name": "USD/JPY", "ticker": "USDJPY=X"},
+    {"name": "AUD/USD", "ticker": "AUDUSD=X"}
 ]
 
 last_processed_candle = {}
@@ -36,7 +40,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"Trading bot (Multi-TF + Test SMS) is running 24/7!")
+        self.wfile.write(b"Trading bot (7 Assets + Multi-TF) is running 24/7!")
 
 def run_web_server():
     port = int(os.environ.get("PORT", 10000))
@@ -58,7 +62,7 @@ def send_sms_eskiz(text: str):
         login_data = {"email": ESKIZ_EMAIL, "password": ESKIZ_PASSWORD}
         resp = requests.post(login_url, data=login_data, timeout=10)
         if resp.status_code != 200:
-            print("Eskiz.uz login xatosi:", resp.text)
+            print("Eskiz login xatosi:", resp.text)
             return
 
         token = resp.json().get("data", {}).get("token")
@@ -73,9 +77,9 @@ def send_sms_eskiz(text: str):
             "from": "4546"
         }
         res_sms = requests.post(sms_url, data=sms_payload, headers=headers, timeout=10)
-        print("Eskiz SMS natijasi:", res_sms.status_code)
+        print("Eskiz SMS holati:", res_sms.status_code)
     except Exception as e:
-        print(f"SMS yuborishda xatolik: {e}")
+        print(f"SMS xatoligi: {e}")
 
 def get_higher_tf_trend(ticker: str):
     trends = {"H4": "NEUTRAL", "D1": "NEUTRAL", "W1": "NEUTRAL"}
@@ -199,7 +203,7 @@ def check_asset(asset: dict):
 
             w1_extra = ""
             if w1_trend == "UP":
-                w1_extra = "\n🔥 *MAXSUS:* W1 global trendi ham tasdiqlandi!"
+                w1_extra = "\n🔥 *MAXSUS:* W1 (Haftalik) global trendi ham to'liq tasdiqlandi!"
 
             msg = (
                 f"🟢 *KUCHLI SIGNAL: SAVDOGA KIRISH (BUY)*\n\n"
@@ -212,11 +216,8 @@ def check_asset(asset: dict):
                 f"🧭 *Trendlar:* H4 [🟢 UP] | D1 [🟢 UP]{w1_extra}"
             )
             send_telegram(msg)
-
-            # SIZ SO'RAGAN JOY: BUY chiqqanda Eskiz ruxsat bergan shablon bo'yicha SMS yuboriladi
             send_sms_eskiz("Bu Eskizdan test")
-
-            print(f"[{name}] BUY signali Telegram va SMS orqali yuborildi.")
+            print(f"[{name}] BUY signali yuborildi.")
             last_processed_candle[ticker] = candle_time
 
         elif h1_sell and h4_trend == "DOWN" and d1_trend == "DOWN":
@@ -225,7 +226,7 @@ def check_asset(asset: dict):
 
             w1_extra = ""
             if w1_trend == "DOWN":
-                w1_extra = "\n🔥 *MAXSUS:* W1 global trendi ham tasdiqlandi!"
+                w1_extra = "\n🔥 *MAXSUS:* W1 (Haftalik) global trendi ham to'liq tasdiqlandi!"
 
             msg = (
                 f"🔴 *KUCHLI SIGNAL: SOTISH (SELL)*\n\n"
@@ -238,11 +239,8 @@ def check_asset(asset: dict):
                 f"🧭 *Trendlar:* H4 [🔴 DOWN] | D1 [🔴 DOWN]{w1_extra}"
             )
             send_telegram(msg)
-
-            # SIZ SO'RAGAN JOY: SELL chiqqanda Eskiz ruxsat bergan shablon bo'yicha SMS yuboriladi
             send_sms_eskiz("Bu Eskizdan test")
-
-            print(f"[{name}] SELL signali Telegram va SMS orqali yuborildi.")
+            print(f"[{name}] SELL signali yuborildi.")
             last_processed_candle[ticker] = candle_time
         else:
             print(f"[{name}] H1: {price:.2f} | H4: {h4_trend} | D1: {d1_trend} | Kutilmoqda...")
@@ -251,13 +249,13 @@ def check_asset(asset: dict):
         print(f"Xatolik ({name}): {e}")
 
 def daily_morning_report():
-    msg = "☀️ *Xayrli tong!*\nBot Multi-Timeframe faol ishlamoqda.\n\n📊 *Bozor holati:*\n"
+    msg = "☀️ *Xayrli tong!*\n7 ta aktiv bo'yicha Multi-TF tahlilchi faol ishlamoqda.\n\n📊 *Bozor holati:*\n"
     for asset in WATCHLIST:
         data = get_market_data(asset["ticker"])
         trends = get_higher_tf_trend(asset["ticker"])
         if data:
-            msg += f"▫️ *{asset['name']}:* `{data['price']:.2f}` (H4: {trends['H4']} | D1: {trends['D1']})\n"
-    msg += "\n🔍 *Signallar nazorat ostida!*"
+            msg += f"▫️ *{asset['name']}:* `{data['price']:.4f}` (H4: {trends['H4']} | D1: {trends['D1']})\n"
+    msg += "\n🔍 *Tasdiqlangan signallar kutilmoqda!*"
     send_telegram(msg)
 
 def listen_for_commands():
@@ -275,21 +273,21 @@ def listen_for_commands():
 
                         if sender_id == CHAT_ID:
                             if text in ["/status", "status", "/holat"]:
-                                status_msg = "⚡ *Joriy bozor va Trendlar holati:*\n\n"
+                                status_msg = "⚡ *Joriy bozor va Trendlar holati (7 ta aktiv):*\n\n"
                                 for asset in WATCHLIST:
                                     data = get_market_data(asset["ticker"])
                                     trends = get_higher_tf_trend(asset["ticker"])
                                     if data:
                                         status_msg += (
                                             f"📌 *{asset['name']}*\n"
-                                            f"💵 Yopilish: `{data['price']:.4f}`\n"
+                                            f"💵 Narx: `{data['price']:.4f}`\n"
                                             f"📊 RSI (H1): `{data['rsi']:.1f}` | MACD: `{data['macd']:.2f}`\n"
                                             f"🧭 Trend: H4 [{trends['H4']}] | D1 [{trends['D1']}] | W1 [{trends['W1']}]\n\n"
                                         )
-                                status_msg += "✅ *Eskiz SMS tizimi faol.*"
+                                status_msg += "✅ *Barcha filtrlar faol.*"
                                 send_telegram(status_msg)
                             elif text in ["/start"]:
-                                send_telegram("👋 Salom! SMS ulangan savdo boti aloqada. Holatni bilish uchun **/status** deb yozing.")
+                                send_telegram("👋 Salom! 7 ta aktiv bo'yicha Multi-TF boti aloqada. Holatni bilish uchun **/status** deb yozing.")
         except Exception:
             time.sleep(2)
         time.sleep(1)
@@ -303,7 +301,7 @@ schedule.every(15).minutes.do(main_job)
 schedule.every().day.at("08:00").do(daily_morning_report)
 
 if __name__ == "__main__":
-    send_telegram("📲 *Bot yangilandi: Test SMS formati muvaffaqiyatli ulandi!*")
+    send_telegram("👑 *Bot yangilandi: 7 ta asosiy aktiv joylashtirildi!*\n(Oltin, Kumush, Neft, GBP/USD, EUR/USD, USD/JPY, AUD/USD)\nMulti-Timeframe va SMS tizimi to'liq faol.")
 
     threading.Thread(target=run_web_server, daemon=True).start()
     threading.Thread(target=listen_for_commands, daemon=True).start()
